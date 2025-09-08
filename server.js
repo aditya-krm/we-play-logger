@@ -1,18 +1,9 @@
-// server.js - Simple logging server with real-time web dashboard
+// server.js - Simple logging server with web dashboard (no Socket.IO)
 import express from "express";
-import { createServer } from "http";
-import { Server as socketIO } from "socket.io";
 import cors from "cors";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 
 const app = express();
-const server = createServer(app);
-const io = new socketIO(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-  },
-});
 
 // Middleware
 app.use(cors());
@@ -65,10 +56,7 @@ app.post("/log", (req, res) => {
     saveLogs();
   }
 
-  // Emit to all connected clients for real-time updates
-  io.emit("newLog", log);
-
-  // Also console log for server monitoring
+  // Console log for server monitoring
   console.log(
     `[${log.type}] ${log.method} ${log.url} - Status: ${
       log.status || "N/A"
@@ -83,11 +71,15 @@ app.get("/api/logs", (req, res) => {
   res.json(logs);
 });
 
+// API to get logs count (for quick polling)
+app.get("/api/logs/count", (req, res) => {
+  res.json({ count: logs.length });
+});
+
 // API to clear logs
 app.delete("/api/logs", (req, res) => {
   logs = [];
   saveLogs();
-  io.emit("logsCleared");
   res.json({ success: true });
 });
 
@@ -101,18 +93,6 @@ app.get("/api/export", (req, res) => {
   res.send(JSON.stringify(logs, null, 2));
 });
 
-// Socket.IO connection
-io.on("connection", (socket) => {
-  console.log("Dashboard connected");
-
-  // Send existing logs to new client
-  socket.emit("initialLogs", logs);
-
-  socket.on("disconnect", () => {
-    console.log("Dashboard disconnected");
-  });
-});
-
 // Serve the dashboard HTML
 app.get("/", (req, res) => {
   res.send(`
@@ -122,7 +102,6 @@ app.get("/", (req, res) => {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>API Logs Dashboard</title>
-    <script src="/socket.io/socket.io.js"></script>
     <style>
         * {
             margin: 0;
@@ -156,6 +135,7 @@ app.get("/", (req, res) => {
         .controls {
             display: flex;
             gap: 10px;
+            align-items: center;
         }
         
         .btn {
@@ -171,6 +151,15 @@ app.get("/", (req, res) => {
         .btn:hover {
             background: #444;
             border-color: #666;
+        }
+        
+        .btn-primary {
+            background: #2196F3;
+            border-color: #1976D2;
+        }
+        
+        .btn-primary:hover {
+            background: #1976D2;
         }
         
         .btn-danger {
@@ -248,23 +237,26 @@ app.get("/", (req, res) => {
             margin-bottom: 10px;
             padding: 15px;
             transition: all 0.2s;
-            animation: slideIn 0.3s ease;
-        }
-        
-        @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateX(-20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateX(0);
-            }
         }
         
         .log-entry:hover {
             border-color: #4CAF50;
             background: #1f1f1f;
+        }
+        
+        .log-entry.new {
+            animation: highlight 1s ease;
+        }
+        
+        @keyframes highlight {
+            0% {
+                background: #2a3a2a;
+                border-color: #4CAF50;
+            }
+            100% {
+                background: #1a1a1a;
+                border-color: #333;
+            }
         }
         
         .log-header {
@@ -298,6 +290,7 @@ app.get("/", (req, res) => {
             font-weight: bold;
             background: #333;
             color: #fff;
+            margin-left: 8px;
         }
         
         .method-get { background: #4CAF50; }
@@ -356,37 +349,42 @@ app.get("/", (req, res) => {
             margin-top: 5px;
         }
         
-        .live-indicator {
-            display: inline-block;
-            width: 8px;
-            height: 8px;
-            background: #4CAF50;
-            border-radius: 50%;
-            margin-right: 5px;
-            animation: pulse 2s infinite;
-        }
-        
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.5; }
-            100% { opacity: 1; }
-        }
-        
         .no-logs {
             text-align: center;
             color: #666;
             padding: 50px;
             font-size: 18px;
         }
+        
+        .refresh-indicator {
+            color: #666;
+            font-size: 12px;
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid #333;
+            border-top-color: #4CAF50;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-left: 10px;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1><span class="live-indicator"></span>API Logs Dashboard</h1>
+        <h1>API Logs Dashboard</h1>
         <div class="controls">
-            <span id="connectionStatus" style="margin-right: 15px; color: #4CAF50;">● Connected</span>
-            <button class="btn" onclick="exportLogs()">Export JSON</button>
-            <button class="btn btn-danger" onclick="clearLogs()">Clear All</button>
+            <span id="lastRefresh" class="refresh-indicator">Never refreshed</span>
+            <button class="btn btn-primary" onclick="refreshLogs()">🔄 Refresh</button>
+            <button class="btn" onclick="exportLogs()">📥 Export JSON</button>
+            <button class="btn btn-danger" onclick="clearLogs()">🗑️ Clear All</button>
         </div>
     </div>
     
@@ -426,7 +424,7 @@ app.get("/", (req, res) => {
         </div>
         <div class="filter-group">
             <label>
-                <input type="checkbox" id="autoScroll" checked> Auto-scroll
+                <input type="checkbox" id="autoRefresh"> Auto-refresh (5s)
             </label>
         </div>
     </div>
@@ -451,56 +449,59 @@ app.get("/", (req, res) => {
     </div>
     
     <div class="logs-container" id="logsContainer">
-        <div class="no-logs">Waiting for logs...</div>
+        <div class="no-logs">Loading logs...</div>
     </div>
 
     <script>
-        const socket = io();
         let allLogs = [];
         let filteredLogs = [];
+        let lastLogCount = 0;
+        let autoRefreshInterval = null;
         
-        // Connection status
-        socket.on('connect', () => {
-            document.getElementById('connectionStatus').innerHTML = '● Connected';
-            document.getElementById('connectionStatus').style.color = '#4CAF50';
-        });
-        
-        socket.on('disconnect', () => {
-            document.getElementById('connectionStatus').innerHTML = '● Disconnected';
-            document.getElementById('connectionStatus').style.color = '#f44336';
-        });
-        
-        // Receive initial logs
-        socket.on('initialLogs', (logs) => {
-            allLogs = logs;
-            applyFilters();
-            updateStats();
-        });
-        
-        // Receive new log
-        socket.on('newLog', (log) => {
-            allLogs.push(log);
-            if (allLogs.length > 1000) {
-                allLogs.shift();
+        // Load logs from server
+        async function loadLogs() {
+            try {
+                const response = await fetch('/api/logs');
+                const logs = await response.json();
+                
+                // Check if there are new logs
+                const hasNewLogs = logs.length > lastLogCount;
+                lastLogCount = logs.length;
+                
+                allLogs = logs;
+                applyFilters(hasNewLogs);
+                updateStats();
+                updateLastRefreshTime();
+            } catch (error) {
+                console.error('Error loading logs:', error);
             }
-            applyFilters();
-            updateStats();
+        }
+        
+        // Refresh logs
+        async function refreshLogs() {
+            const button = event?.target;
+            if (button) {
+                button.disabled = true;
+                button.innerHTML = '⏳ Loading...';
+            }
             
-            if (document.getElementById('autoScroll').checked) {
-                const container = document.getElementById('logsContainer');
-                container.scrollTop = container.scrollHeight;
+            await loadLogs();
+            
+            if (button) {
+                button.disabled = false;
+                button.innerHTML = '🔄 Refresh';
             }
-        });
+        }
         
-        // Logs cleared
-        socket.on('logsCleared', () => {
-            allLogs = [];
-            applyFilters();
-            updateStats();
-        });
+        // Update last refresh time
+        function updateLastRefreshTime() {
+            const now = new Date();
+            document.getElementById('lastRefresh').textContent = 
+                'Last refresh: ' + now.toLocaleTimeString();
+        }
         
         // Apply filters
-        function applyFilters() {
+        function applyFilters(hasNewLogs = false) {
             const searchTerm = document.getElementById('searchFilter').value.toLowerCase();
             const typeFilter = document.getElementById('typeFilter').value;
             const methodFilter = document.getElementById('methodFilter').value;
@@ -532,11 +533,11 @@ app.get("/", (req, res) => {
                 return true;
             });
             
-            renderLogs();
+            renderLogs(hasNewLogs);
         }
         
         // Render logs
-        function renderLogs() {
+        function renderLogs(hasNewLogs = false) {
             const container = document.getElementById('logsContainer');
             
             if (filteredLogs.length === 0) {
@@ -544,13 +545,123 @@ app.get("/", (req, res) => {
                 return;
             }
             
-            container.innerHTML = filteredLogs.map(log => {
+            // Reverse to show newest first
+            const reversedLogs = [...filteredLogs].reverse();
+            
+            container.innerHTML = reversedLogs.map((log, index) => {
                 const typeClass = 'type-' + (log.type || 'unknown').toLowerCase().replace(/_/g, '_');
                 const methodClass = log.method ? 'method-' + log.method.toLowerCase() : '';
                 const statusClass = log.status >= 200 && log.status < 300 ? 'status-success' : 'status-error';
+                const newClass = hasNewLogs && index === 0 ? 'new' : '';
                 
                 let dataHtml = '';
-                if (log.data || log.error) {
+                
+                // Enhanced data display based on log type
+                if (log.type === 'REQUEST') {
+                    dataHtml = \`
+                        <div class="toggle-data" onclick="toggleData(this)">▶ Show Request Details</div>
+                        <div class="log-data" style="display: none;">
+                            \${log.fullUrl ? \`<div class="log-section">
+                                <div class="log-section-title">🌐 URL Details</div>
+                                <div class="log-section-content">
+                                    <div><strong>Full URL:</strong> \${log.fullUrl}</div>
+                                    \${log.urlDetails ? \`
+                                        <div><strong>Base URL:</strong> \${log.urlDetails.baseURL || 'N/A'}</div>
+                                        <div><strong>Path:</strong> \${log.urlDetails.path || 'N/A'}</div>
+                                        \${log.urlDetails.queryParams ? \`<div><strong>Query Params:</strong><pre>\${JSON.stringify(log.urlDetails.queryParams, null, 2)}</pre></div>\` : ''}
+                                        \${log.urlDetails.signatureParams ? \`<div><strong>Signature:</strong><pre>\${JSON.stringify(log.urlDetails.signatureParams, null, 2)}</pre></div>\` : ''}
+                                    \` : ''}
+                                </div>
+                            </div>\` : ''}
+                            
+                            \${log.headers ? \`<div class="log-section">
+                                <div class="log-section-title">📋 Headers</div>
+                                <div class="log-section-content">
+                                    <div><strong>Authorization:</strong> \${log.headers.authorization || 'None'}</div>
+                                    <div><strong>Content-Type:</strong> \${log.headers.contentType || 'Not Set'}</div>
+                                    <details>
+                                        <summary style="cursor: pointer; color: #4CAF50;">All Headers</summary>
+                                        <pre>\${JSON.stringify(log.headers.all, null, 2)}</pre>
+                                    </details>
+                                </div>
+                            </div>\` : ''}
+                            
+                            \${log.payload ? \`<div class="log-section">
+                                <div class="log-section-title">📤 Request Payload</div>
+                                <div class="log-section-content">
+                                    <div><strong>Data Type:</strong> \${log.payload.dataType}</div>
+                                    <div><strong>Data Size:</strong> \${log.payload.dataSize} bytes</div>
+                                    \${log.payload.data ? \`<div><strong>Data:</strong><pre>\${JSON.stringify(log.payload.data, null, 2)}</pre></div>\` : '<div>No payload data</div>'}
+                                </div>
+                            </div>\` : ''}
+                            
+                            \${log.axiosConfig ? \`<div class="log-section">
+                                <div class="log-section-title">⚙️ Config</div>
+                                <div class="log-section-content">
+                                    <pre>\${JSON.stringify(log.axiosConfig, null, 2)}</pre>
+                                </div>
+                            </div>\` : ''}
+                        </div>
+                    \`;
+                } else if (log.type === 'RESPONSE') {
+                    dataHtml = \`
+                        <div class="toggle-data" onclick="toggleData(this)">▶ Show Response Details</div>
+                        <div class="log-data" style="display: none;">
+                            \${log.responseData ? \`<div class="log-section">
+                                <div class="log-section-title">📥 Response Data</div>
+                                <div class="log-section-content">
+                                    <div><strong>Success:</strong> \${log.responseData.isSuccess !== undefined ? log.responseData.isSuccess : 'N/A'}</div>
+                                    <div><strong>Message:</strong> \${log.responseData.message || 'None'}</div>
+                                    <div><strong>Data Type:</strong> \${log.responseData.dataType}</div>
+                                    <div><strong>Data Size:</strong> \${log.responseData.dataSize} bytes</div>
+                                    \${log.responseData.truncated ? '<div style="color: #ff9800;">⚠️ Large response truncated</div>' : ''}
+                                    \${log.responseData.full ? \`<details>
+                                        <summary style="cursor: pointer; color: #4CAF50;">Response Body</summary>
+                                        <pre>\${typeof log.responseData.full === 'string' ? log.responseData.full : JSON.stringify(log.responseData.full, null, 2)}</pre>
+                                    </details>\` : ''}
+                                </div>
+                            </div>\` : ''}
+                            
+                            \${log.responseHeaders ? \`<div class="log-section">
+                                <div class="log-section-title">📋 Response Headers</div>
+                                <div class="log-section-content">
+                                    <pre>\${JSON.stringify(log.responseHeaders, null, 2)}</pre>
+                                </div>
+                            </div>\` : ''}
+                            
+                            \${log.requestDetails ? \`<div class="log-section">
+                                <div class="log-section-title">🔄 Original Request</div>
+                                <div class="log-section-content">
+                                    <details>
+                                        <summary style="cursor: pointer; color: #888;">View Request Details</summary>
+                                        <pre>\${JSON.stringify(log.requestDetails, null, 2)}</pre>
+                                    </details>
+                                </div>
+                            </div>\` : ''}
+                        </div>
+                    \`;
+                } else if (log.type && log.type.includes('ERROR')) {
+                    dataHtml = \`
+                        <div class="toggle-data" onclick="toggleData(this)">▶ Show Error Details</div>
+                        <div class="log-data" style="display: none;">
+                            \${log.error ? \`<div class="log-section">
+                                <div class="log-section-title">❌ Error Information</div>
+                                <div class="log-section-content">
+                                    <div><strong>Message:</strong> \${log.error.message || 'Unknown error'}</div>
+                                    <div><strong>Code:</strong> \${log.error.code || 'N/A'}</div>
+                                    \${log.error.isNetworkError !== undefined ? \`<div><strong>Network Error:</strong> \${log.error.isNetworkError}</div>\` : ''}
+                                    \${log.error.isTimeout !== undefined ? \`<div><strong>Timeout:</strong> \${log.error.isTimeout}</div>\` : ''}
+                                    \${log.error.responseData ? \`<div><strong>Response Data:</strong><pre>\${JSON.stringify(log.error.responseData, null, 2)}</pre></div>\` : ''}
+                                    \${log.error.stack ? \`<details>
+                                        <summary style="cursor: pointer; color: #f44336;">Stack Trace</summary>
+                                        <pre style="color: #f44336;">\${log.error.stack}</pre>
+                                    </details>\` : ''}
+                                </div>
+                            </div>\` : ''}
+                        </div>
+                    \`;
+                } else if (log.data || log.error) {
+                    // Fallback for other log types
                     const dataToShow = log.data || log.error;
                     dataHtml = \`
                         <div class="toggle-data" onclick="toggleData(this)">▶ Show Data</div>
@@ -560,21 +671,25 @@ app.get("/", (req, res) => {
                     \`;
                 }
                 
+                // Main log entry with enhanced metadata
                 return \`
-                    <div class="log-entry">
+                    <div class="log-entry \${newClass}">
                         <div class="log-header">
                             <div>
                                 <span class="log-type \${typeClass}">\${log.type || 'LOG'}</span>
                                 \${log.method ? \`<span class="log-method \${methodClass}">\${log.method}</span>\` : ''}
+                                \${log.requestId ? \`<span style="color: #666; font-size: 10px; margin-left: 10px;">ID: \${log.requestId}</span>\` : ''}
                             </div>
-                            <div style="color: #666; font-size: 12px;">\${new Date(log.timestamp).toLocaleTimeString()}</div>
+                            <div style="color: #666; font-size: 12px;">\${new Date(log.timestamp || log.receivedAt).toLocaleString()}</div>
                         </div>
-                        <div class="log-url">\${log.url || 'N/A'}</div>
+                        <div class="log-url">\${log.fullUrl || log.url || 'N/A'}</div>
                         <div class="log-details">
                             \${log.status ? \`<div class="log-detail"><span class="detail-label">Status:</span> <span class="\${statusClass}">\${log.status}</span></div>\` : ''}
-                            \${log.duration ? \`<div class="log-detail"><span class="detail-label">Duration:</span> \${log.duration}ms</div>\` : ''}
+                            \${log.duration ? \`<div class="log-detail"><span class="detail-label">Duration:</span> <span style="color: \${log.duration > 1000 ? '#ff9800' : '#4CAF50'};">\${log.duration}ms</span></div>\` : ''}
                             \${log.platform ? \`<div class="log-detail"><span class="detail-label">Platform:</span> \${log.platform}</div>\` : ''}
-                            \${log.requestId ? \`<div class="log-detail"><span class="detail-label">Request ID:</span> \${log.requestId}</div>\` : ''}
+                            \${log.environment ? \`<div class="log-detail"><span class="detail-label">Environment:</span> \${log.environment}</div>\` : ''}
+                            \${log.fromCache ? \`<div class="log-detail"><span class="detail-label" style="color: #2196F3;">📦 From Cache</span></div>\` : ''}
+                            \${log.isRetry ? \`<div class="log-detail"><span class="detail-label" style="color: #ff9800;">🔄 Retry Request</span></div>\` : ''}
                         </div>
                         \${dataHtml}
                     </div>
@@ -612,10 +727,14 @@ app.get("/", (req, res) => {
         }
         
         // Clear logs
-        function clearLogs() {
-            if (confirm('Clear all logs?')) {
-                fetch('/api/logs', { method: 'DELETE' })
-                    .then(() => console.log('Logs cleared'));
+        async function clearLogs() {
+            if (confirm('Are you sure you want to clear all logs?')) {
+                try {
+                    await fetch('/api/logs', { method: 'DELETE' });
+                    await loadLogs();
+                } catch (error) {
+                    console.error('Error clearing logs:', error);
+                }
             }
         }
         
@@ -624,11 +743,26 @@ app.get("/", (req, res) => {
             window.location.href = '/api/export';
         }
         
+        // Handle auto-refresh
+        function toggleAutoRefresh() {
+            const checkbox = document.getElementById('autoRefresh');
+            if (checkbox.checked) {
+                autoRefreshInterval = setInterval(loadLogs, 5000);
+            } else {
+                clearInterval(autoRefreshInterval);
+                autoRefreshInterval = null;
+            }
+        }
+        
         // Event listeners
-        document.getElementById('searchFilter').addEventListener('input', applyFilters);
-        document.getElementById('typeFilter').addEventListener('change', applyFilters);
-        document.getElementById('methodFilter').addEventListener('change', applyFilters);
-        document.getElementById('statusFilter').addEventListener('change', applyFilters);
+        document.getElementById('searchFilter').addEventListener('input', () => applyFilters());
+        document.getElementById('typeFilter').addEventListener('change', () => applyFilters());
+        document.getElementById('methodFilter').addEventListener('change', () => applyFilters());
+        document.getElementById('statusFilter').addEventListener('change', () => applyFilters());
+        document.getElementById('autoRefresh').addEventListener('change', toggleAutoRefresh);
+        
+        // Initial load
+        loadLogs();
     </script>
 </body>
 </html>
@@ -636,14 +770,14 @@ app.get("/", (req, res) => {
 });
 
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`
 ╔═══════════════════════════════════════════════════╗
 ║                                                   ║
 ║     🚀 Logging Server Started Successfully!       ║
 ║                                                   ║
-║     Dashboard: http://localhost:${PORT}           ║
-║     Log Endpoint: http://localhost:${PORT}/log    ║
+║     Dashboard: http://localhost:${PORT}              ║
+║     Log Endpoint: http://localhost:${PORT}/log       ║
 ║                                                   ║
 ║     Logs are saved to: api_logs.json              ║
 ║                                                   ║
